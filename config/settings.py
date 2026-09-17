@@ -37,3 +37,4 @@ MCP_API_KEY = os.getenv(
 )
 
 DEFAULT_ROLE = "reader"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")

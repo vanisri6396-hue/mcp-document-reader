@@ -59,6 +59,12 @@ def register_tools(
             ),
         ],
     ) -> OperationResult:
+        """
+        Create a new text document.
+
+        Use this tool when the user wants to create
+        and save a new document.
+        """
 
         try:
 
@@ -106,6 +112,12 @@ def register_tools(
             ),
         ] = 5000,
     ) -> str:
+        """
+        Read the contents of an existing text document.
+
+        Use this tool when the user wants to view,
+        inspect, or retrieve document contents.
+        """
 
         try:
 
@@ -150,6 +162,12 @@ def register_tools(
             ),
         ],
     ) -> OperationResult:
+        """
+        Update the contents of an existing text document.
+
+        Use this tool when the user wants to modify
+        or replace document content.
+        """
 
         try:
 
@@ -189,6 +207,12 @@ def register_tools(
             ),
         ],
     ) -> OperationResult:
+        """
+        Permanently delete an existing text document.
+
+        Use this tool only when the user explicitly
+        requests document deletion.
+        """
 
         try:
 
@@ -236,6 +260,12 @@ def register_tools(
             ),
         ] = 10,
     ) -> DocumentList:
+        """
+        List available text documents with pagination.
+
+        Use this tool when the user wants to see
+        which documents are available.
+        """
 
         try:
 
@@ -280,6 +310,12 @@ def register_tools(
             ),
         ] = False,
     ) -> SearchResult:
+        """
+        Search across available text documents.
+
+        Use this tool when the user wants to find
+        documents containing specific text.
+        """
 
         try:
 
