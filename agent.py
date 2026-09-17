@@ -6,7 +6,7 @@ from mcp.client.stdio import stdio_client
 
 from llm.groq_client import GroqClient
 from ai_client import extract_mcp_tools, convert_to_llm_tools
-
+from context.manager import ContextManager
 
 server_params = StdioServerParameters(
     command="python",
@@ -50,12 +50,13 @@ async def run_agent(user_message: str):
             # 4. INITIAL MESSAGE
             # --------------------------------------------------
 
-            messages = [
+            context_manager = ContextManager(max_messages=20)
+            context_manager.add_message(
                 {
                     "role": "user",
                     "content": user_message,
                 }
-            ]
+            )
 
             # --------------------------------------------------
             # 5. AGENT LOOP
@@ -64,6 +65,10 @@ async def run_agent(user_message: str):
             max_iterations = 5
 
             for iteration in range(1, max_iterations + 1):
+                print(
+                    f"\nContext messages: "
+                    f"{context_manager.message_count()}"
+                )
 
                 print("\n" + "=" * 70)
                 print(f"AGENT ITERATION {iteration}")
@@ -72,7 +77,7 @@ async def run_agent(user_message: str):
                 # Ask LLM
                 response = llm.client.chat.completions.create(
                     model="openai/gpt-oss-20b",
-                    messages=messages,
+                    messages=context_manager.get_messages(),
                     tools=llm_tools,
                     tool_choice="auto",
                 )
@@ -114,7 +119,7 @@ async def run_agent(user_message: str):
                         }
                     )
 
-                messages.append(
+                context_manager.add_and_trim(
                     {
                         "role": "assistant",
                         "content": message.content,
@@ -168,7 +173,7 @@ async def run_agent(user_message: str):
                     # 10. SEND RESULT BACK TO LLM
                     # --------------------------------------------------
 
-                    messages.append(
+                    context_manager.add_and_trim(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
