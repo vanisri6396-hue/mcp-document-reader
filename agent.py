@@ -1,214 +1,825 @@
 import asyncio
 import json
+import logging
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from llm.groq_client import GroqClient
-from ai_client import extract_mcp_tools, convert_to_llm_tools
 from context.manager import ContextManager
+from llm.groq_client import GroqClient
+
+from security.ai_safety import (
+    inspect_tool_call,
+    enforce_tool_safety,
+    UnsafeToolCallError,
+)
+
+from security.output_validation import (
+    validate_final_answer,
+    UnsafeOutputError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 server_params = StdioServerParameters(
     command="python",
     args=["server.py"],
 )
 
+MAX_ITERATIONS = 5
+MAX_TOTAL_TOOL_CALLS = 10
 
-async def run_agent(user_message: str):
 
-    async with stdio_client(server_params) as (read, write):
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-        async with ClientSession(read, write) as session:
+logger = logging.getLogger("DocumentMCP.Agent")
 
-            # --------------------------------------------------
-            # 1. CONNECT TO MCP SERVER
-            # --------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Context display
+# ---------------------------------------------------------------------------
+
+def print_context_status(
+    context: ContextManager,
+) -> None:
+
+    stats = context.get_stats()
+
+    print("\n" + "-" * 70)
+    print("CONTEXT STATUS")
+    print("-" * 70)
+
+    print(
+        f"Messages: {stats.message_count}"
+    )
+
+    print(
+        f"Estimated tokens: {stats.estimated_tokens}"
+    )
+
+    print(
+        f"Maximum context tokens: "
+        f"{stats.max_context_tokens}"
+    )
+
+    print(
+        f"Remaining tokens: "
+        f"{stats.remaining_tokens}"
+    )
+
+    print(
+        f"Maximum messages: "
+        f"{stats.max_messages}"
+    )
+
+    print(
+        f"Truncated tool results: "
+        f"{stats.truncated_tool_results}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MCP result extraction
+# ---------------------------------------------------------------------------
+
+def extract_tool_result(result) -> str:
+
+    if hasattr(result, "content"):
+
+        parts = []
+
+        for item in result.content:
+
+            if hasattr(item, "text"):
+                parts.append(item.text)
+
+            else:
+                parts.append(str(item))
+
+        return "\n".join(parts)
+
+    return str(result)
+
+
+# ---------------------------------------------------------------------------
+# Destructive confirmation
+# ---------------------------------------------------------------------------
+
+def ask_for_confirmation(
+    tool_name: str,
+    arguments: dict,
+) -> bool:
+
+    print("\n" + "!" * 70)
+    print("CONFIRMATION REQUIRED")
+    print("!" * 70)
+
+    print(
+        "\nThe AI requested a potentially destructive operation."
+    )
+
+    print(
+        f"\nTool: {tool_name}"
+    )
+
+    print(
+        "\nArguments:"
+    )
+
+    print(
+        json.dumps(
+            arguments,
+            indent=2,
+        )
+    )
+
+    print(
+        "\nThis operation may permanently modify or delete data."
+    )
+
+    response = input(
+        "\nDo you explicitly approve this operation? "
+        "[yes/no]: "
+    ).strip().lower()
+
+    return response in {
+        "yes",
+        "y",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main agent
+# ---------------------------------------------------------------------------
+
+async def main():
+
+    print("\n" + "=" * 70)
+    print("LEVEL 7.10 — AI SAFETY + MCP AGENT")
+    print("=" * 70)
+
+    user_request = (
+        "Search my documents for the word MCP. "
+        "Then read the matching document and explain what it says."
+    )
+
+    print("\nUSER REQUEST:")
+    print(user_request)
+
+    # -----------------------------------------------------------------------
+    # Context manager
+    # -----------------------------------------------------------------------
+
+    context = ContextManager(
+        max_messages=20,
+        max_context_tokens=6000,
+        max_tool_result_chars=8000,
+        response_token_reserve=1000,
+    )
+
+    # Grounding instruction
+    context.add_message(
+        {
+            "role": "system",
+            "content": (
+                "You are a document assistant. "
+                "Use MCP tools when necessary. "
+                "When answering about document contents, "
+                "base your answer on the tool results provided "
+                "in this conversation. "
+                "Do not invent facts that are not supported by "
+                "the retrieved document. "
+                "If information is not present in the document, "
+                "say that it is not stated."
+            ),
+        }
+    )
+
+    context.add_message(
+        {
+            "role": "user",
+            "content": user_request,
+        }
+    )
+
+    llm = GroqClient()
+
+    total_tool_calls = 0
+
+    async with stdio_client(
+        server_params
+    ) as (read, write):
+
+        async with ClientSession(
+            read,
+            write,
+        ) as session:
 
             await session.initialize()
 
-            print("\nConnected to MCP server.")
-
-            # --------------------------------------------------
-            # 2. DISCOVER MCP TOOLS
-            # --------------------------------------------------
-
-            tools_result = await session.list_tools()
-            tools = tools_result.tools
-
-            print(f"Discovered {len(tools)} MCP tools.")
-
-            mcp_tools = extract_mcp_tools(tools)
-            llm_tools = convert_to_llm_tools(mcp_tools)
-
-            # --------------------------------------------------
-            # 3. CREATE LLM CLIENT
-            # --------------------------------------------------
-
-            llm = GroqClient()
-
-            # --------------------------------------------------
-            # 4. INITIAL MESSAGE
-            # --------------------------------------------------
-
-            context_manager = ContextManager(max_messages=20)
-            context_manager.add_message(
-                {
-                    "role": "user",
-                    "content": user_message,
-                }
+            print(
+                "\nConnected to MCP server."
             )
 
-            # --------------------------------------------------
-            # 5. AGENT LOOP
-            # --------------------------------------------------
+            # ----------------------------------------------------------------
+            # Tool discovery
+            # ----------------------------------------------------------------
 
-            max_iterations = 5
+            tools_result = await session.list_tools()
 
-            for iteration in range(1, max_iterations + 1):
-                print(
-                    f"\nContext messages: "
-                    f"{context_manager.message_count()}"
+            tools = tools_result.tools
+
+            print(
+                f"Discovered {len(tools)} MCP tools."
+            )
+
+            llm_tools = []
+
+            for tool in tools:
+
+                llm_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": (
+                                tool.description or ""
+                            ),
+                            "parameters": (
+                                tool.input_schema
+                            ),
+                        },
+                    }
                 )
+
+            print_context_status(
+                context
+            )
+
+            # ================================================================
+            # AGENT LOOP
+            # ================================================================
+
+            for iteration in range(
+                1,
+                MAX_ITERATIONS + 1,
+            ):
 
                 print("\n" + "=" * 70)
-                print(f"AGENT ITERATION {iteration}")
-                print("=" * 70)
 
-                # Ask LLM
-                response = llm.client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
-                    messages=context_manager.get_messages(),
-                    tools=llm_tools,
-                    tool_choice="auto",
+                print(
+                    f"AGENT ITERATION {iteration}"
                 )
 
-                message = response.choices[0].message
+                print("=" * 70)
 
-                # --------------------------------------------------
-                # 6. CHECK WHETHER LLM WANTS A TOOL
-                # --------------------------------------------------
+                # ------------------------------------------------------------
+                # Global loop safety
+                # ------------------------------------------------------------
 
-                if not message.tool_calls:
+                if total_tool_calls >= MAX_TOTAL_TOOL_CALLS:
 
-                    print("\nLLM produced final answer.")
-
-                    print("\n" + "=" * 70)
-                    print("FINAL ANSWER")
-                    print("=" * 70)
-
-                    print("\n" + (message.content or ""))
+                    print(
+                        "\nAgent stopped: maximum total "
+                        "tool-call limit reached."
+                    )
 
                     return
 
-                # --------------------------------------------------
-                # 7. ADD ASSISTANT TOOL-CALL MESSAGE
-                # --------------------------------------------------
+                messages = context.get_messages()
+
+                try:
+
+                    response = (
+                        llm.client.chat.completions.create(
+                            model="openai/gpt-oss-20b",
+                            messages=messages,
+                            tools=llm_tools,
+                            tool_choice="auto",
+                        )
+                    )
+
+                except Exception as error:
+
+                    print(
+                        "\nLLM ERROR"
+                    )
+
+                    print(
+                        "The language model request failed safely."
+                    )
+
+                    logger.error(
+                        "LLM request failed: %s",
+                        type(error).__name__,
+                    )
+
+                    return
+
+                assistant_message = (
+                    response.choices[0].message
+                )
+
+                # ------------------------------------------------------------
+                # Final response
+                # ------------------------------------------------------------
+
+                if not assistant_message.tool_calls:
+
+                    raw_answer = (
+                        assistant_message.content
+                        or ""
+                    )
+
+                    try:
+
+                        final_answer = (
+                            validate_final_answer(
+                                raw_answer
+                            )
+                        )
+
+                    except UnsafeOutputError as error:
+
+                        print(
+                            "\nOUTPUT SAFETY CHECK"
+                        )
+
+                        print(
+                            "-" * 70
+                        )
+
+                        print(
+                            "Status: BLOCKED"
+                        )
+
+                        print(
+                            f"Reason: {error}"
+                        )
+
+                        return
+
+                    context.add_message(
+                        {
+                            "role": "assistant",
+                            "content": final_answer,
+                        }
+                    )
+
+                    print(
+                        "\nLLM produced final answer."
+                    )
+
+                    print(
+                        "\n" + "=" * 70
+                    )
+
+                    print(
+                        "FINAL ANSWER"
+                    )
+
+                    print(
+                        "=" * 70
+                    )
+
+                    print(
+                        f"\n{final_answer}"
+                    )
+
+                    print_context_status(
+                        context
+                    )
+
+                    print(
+                        "\n" + "=" * 70
+                    )
+
+                    print(
+                        "LEVEL 7.10 AI SAFETY"
+                    )
+
+                    print(
+                        "=" * 70
+                    )
+
+                    print(
+                        "\nPrompt-injection awareness : COMPLETE"
+                    )
+
+                    print(
+                        "Tool-call validation       : COMPLETE"
+                    )
+
+                    print(
+                        "Argument validation        : COMPLETE"
+                    )
+
+                    print(
+                        "Dangerous-tool protection : COMPLETE"
+                    )
+
+                    print(
+                        "Authorization enforcement : COMPLETE"
+                    )
+
+                    print(
+                        "Malicious-content handling: COMPLETE"
+                    )
+
+                    print(
+                        "LLM output validation     : COMPLETE"
+                    )
+
+                    print(
+                        "Agent loop limits         : COMPLETE"
+                    )
+
+                    print(
+                        "Safe error handling       : COMPLETE"
+                    )
+
+                    print(
+                        "AI safety testing         : COMPLETE"
+                    )
+
+                    return
+
+                # ------------------------------------------------------------
+                # Add assistant tool request to context
+                # ------------------------------------------------------------
 
                 assistant_tool_calls = []
 
-                for tool_call in message.tool_calls:
+                for tool_call in (
+                    assistant_message.tool_calls
+                ):
 
                     assistant_tool_calls.append(
                         {
                             "id": tool_call.id,
                             "type": "function",
                             "function": {
-                                "name": tool_call.function.name,
-                                "arguments": tool_call.function.arguments,
+                                "name": (
+                                    tool_call.function.name
+                                ),
+                                "arguments": (
+                                    tool_call.function.arguments
+                                ),
                             },
                         }
                     )
 
-                context_manager.add_and_trim(
+                context.add_message(
                     {
                         "role": "assistant",
-                        "content": message.content,
-                        "tool_calls": assistant_tool_calls,
+                        "content": (
+                            assistant_message.content
+                        ),
+                        "tool_calls": (
+                            assistant_tool_calls
+                        ),
                     }
                 )
 
-                # --------------------------------------------------
-                # 8. EXECUTE EVERY REQUESTED TOOL
-                # --------------------------------------------------
+                # ------------------------------------------------------------
+                # Process tool calls
+                # ------------------------------------------------------------
 
-                for tool_call in message.tool_calls:
+                for tool_call in (
+                    assistant_message.tool_calls
+                ):
 
-                    tool_name = tool_call.function.name
+                    total_tool_calls += 1
 
-                    arguments = json.loads(
+                    tool_name = (
+                        tool_call.function.name
+                    )
+
+                    raw_arguments = (
                         tool_call.function.arguments
                     )
 
-                    print("\nLLM requested tool:")
-                    print(f"  {tool_name}")
+                    print(
+                        "\nLLM requested tool:"
+                    )
 
-                    print("\nArguments:")
-                    print(json.dumps(arguments, indent=2))
+                    print(
+                        f"  {tool_name}"
+                    )
 
-                    print("\nExecuting MCP tool...")
+                    print(
+                        "\nArguments:"
+                    )
 
-                    tool_result = await session.call_tool(
+                    try:
+
+                        arguments = json.loads(
+                            raw_arguments
+                        )
+
+                        print(
+                            json.dumps(
+                                arguments,
+                                indent=2,
+                            )
+                        )
+
+                    except json.JSONDecodeError:
+
+                        arguments = raw_arguments
+
+                        print(
+                            raw_arguments
+                        )
+
+                    # --------------------------------------------------------
+                    # AI safety inspection
+                    # --------------------------------------------------------
+
+                    print(
+                        "\nRunning AI safety inspection..."
+                    )
+
+                    decision = inspect_tool_call(
                         tool_name,
                         arguments,
                     )
 
-                    # --------------------------------------------------
-                    # 9. EXTRACT TOOL RESULT
-                    # --------------------------------------------------
-
-                    result_parts = []
-
-                    for content in tool_result.content:
-
-                        if hasattr(content, "text"):
-                            result_parts.append(content.text)
-
-                    tool_output = "\n".join(result_parts)
-
-                    print("\nMCP tool result:")
-                    print("-" * 70)
-                    print(tool_output)
-
-                    # --------------------------------------------------
-                    # 10. SEND RESULT BACK TO LLM
-                    # --------------------------------------------------
-
-                    context_manager.add_and_trim(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_output,
-                        }
+                    print(
+                        "\nAI SAFETY CHECK"
                     )
 
-            # --------------------------------------------------
-            # 11. SAFETY LIMIT
-            # --------------------------------------------------
+                    print(
+                        "-" * 70
+                    )
 
-            print("\n" + "=" * 70)
-            print("AGENT STOPPED")
-            print("=" * 70)
+                    print(
+                        f"Tool: {decision.tool_name}"
+                    )
+
+                    print(
+                        f"Risk level: "
+                        f"{decision.risk_level}"
+                    )
+
+                    print(
+                        f"Status: "
+                        f"{'ALLOWED' if decision.allowed else 'BLOCKED'}"
+                    )
+
+                    if not decision.allowed:
+
+                        blocked_result = (
+                            "Tool call blocked by AI safety: "
+                            + decision.reason
+                        )
+
+                        print(
+                            f"Reason: "
+                            f"{decision.reason}"
+                        )
+
+                        context.add_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": (
+                                    tool_call.id
+                                ),
+                                "name": tool_name,
+                                "content": blocked_result,
+                            }
+                        )
+
+                        print_context_status(
+                            context
+                        )
+
+                        continue
+
+                    # --------------------------------------------------------
+                    # Destructive confirmation
+                    # --------------------------------------------------------
+
+                    confirmed = False
+
+                    if decision.requires_confirmation:
+
+                        confirmed = ask_for_confirmation(
+                            tool_name,
+                            arguments,
+                        )
+
+                        if not confirmed:
+
+                            print(
+                                "\nOperation BLOCKED."
+                            )
+
+                            print(
+                                "User did not provide "
+                                "explicit confirmation."
+                            )
+
+                            blocked_result = (
+                                "The requested destructive "
+                                "operation was blocked because "
+                                "the user did not provide "
+                                "explicit confirmation."
+                            )
+
+                            context.add_message(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": (
+                                        tool_call.id
+                                    ),
+                                    "name": tool_name,
+                                    "content": blocked_result,
+                                }
+                            )
+
+                            print_context_status(
+                                context
+                            )
+
+                            continue
+
+                    # --------------------------------------------------------
+                    # Final AI safety enforcement
+                    # --------------------------------------------------------
+
+                    try:
+
+                        safe_arguments = (
+                            enforce_tool_safety(
+                                tool_name,
+                                arguments,
+                                confirmed=confirmed,
+                            )
+                        )
+
+                    except UnsafeToolCallError as error:
+
+                        print(
+                            "\nAI SAFETY ENFORCEMENT"
+                        )
+
+                        print(
+                            "-" * 70
+                        )
+
+                        print(
+                            "Status: BLOCKED"
+                        )
+
+                        print(
+                            f"Reason: {error}"
+                        )
+
+                        context.add_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": (
+                                    tool_call.id
+                                ),
+                                "name": tool_name,
+                                "content": (
+                                    "Tool call blocked by "
+                                    "AI safety enforcement."
+                                ),
+                            }
+                        )
+
+                        print_context_status(
+                            context
+                        )
+
+                        continue
+
+                    # --------------------------------------------------------
+                    # MCP execution
+                    # --------------------------------------------------------
+
+                    print(
+                        "\nExecuting MCP tool..."
+                    )
+
+                    try:
+
+                        result = await session.call_tool(
+                            tool_name,
+                            safe_arguments,
+                        )
+
+                        result_text = (
+                            extract_tool_result(
+                                result
+                            )
+                        )
+
+                        print(
+                            "\nMCP tool result:"
+                        )
+
+                        print(
+                            "-" * 70
+                        )
+
+                        print(
+                            result_text
+                        )
+
+                        optimized_result = (
+                            context.optimize_tool_result(
+                                result_text
+                            )
+                        )
+
+                        context.add_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": (
+                                    tool_call.id
+                                ),
+                                "name": tool_name,
+                                "content": (
+                                    optimized_result
+                                ),
+                            }
+                        )
+
+                    except Exception as error:
+
+                        # Never expose raw internal exceptions,
+                        # file paths, credentials, or stack traces
+                        # to the LLM/user.
+
+                        safe_error = (
+                            "The MCP tool execution failed "
+                            "and was safely handled."
+                        )
+
+                        logger.error(
+                            "MCP tool failed: %s",
+                            type(error).__name__,
+                        )
+
+                        print(
+                            "\nMCP EXECUTION ERROR"
+                        )
+
+                        print(
+                            "-" * 70
+                        )
+
+                        print(
+                            safe_error
+                        )
+
+                        context.add_message(
+                            {
+                                "role": "tool",
+                                "tool_call_id": (
+                                    tool_call.id
+                                ),
+                                "name": tool_name,
+                                "content": safe_error,
+                            }
+                        )
+
+                    print_context_status(
+                        context
+                    )
+
+            # ----------------------------------------------------------------
+            # Maximum iteration reached
+            # ----------------------------------------------------------------
 
             print(
-                f"\nMaximum of {max_iterations} iterations reached."
+                "\n" + "=" * 70
             )
 
+            print(
+                "AGENT LOOP LIMIT"
+            )
 
-async def main():
+            print(
+                "=" * 70
+            )
 
-    print("\n" + "=" * 70)
-    print("LEVEL 7.8 — MULTI-STEP MCP AGENT")
-    print("=" * 70)
+            print(
+                f"\nAgent stopped safely after "
+                f"{MAX_ITERATIONS} iterations."
+            )
 
-    user_message = (
-        "Search my documents for the word MCP. "
-        "Then read the matching document and explain what it says."
-    )
-
-    print("\nUSER REQUEST:")
-    print(user_message)
-
-    await run_agent(user_message)
+            print(
+                "No additional tool calls will be executed."
+            )
 
 
 if __name__ == "__main__":
