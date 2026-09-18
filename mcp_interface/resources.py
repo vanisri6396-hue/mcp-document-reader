@@ -27,26 +27,55 @@ def register_resources(
     def document_resource(
         doc_id: str,
     ) -> str:
+        """
+        Expose a document through the MCP resource template.
+
+        Resource URI pattern:
+            document://{doc_id}
+
+        Example:
+            document://report.txt
+
+        The resource identifier is validated before it is
+        resolved to a document. Filesystem paths are never
+        accepted directly through the resource URI.
+        """
 
         try:
 
-            # Centralized security layer
+            # ------------------------------------------------
+            # 1. Security
+            # ------------------------------------------------
             secure_request(
                 "document_resource"
             )
 
-            # Validation
+            # ------------------------------------------------
+            # 2. Validate resource identifier
+            # ------------------------------------------------
             doc_id = validate_document_name(
                 doc_id
             )
 
-            # Repository access
-            return repository_read_document(
-                doc_id
+            # ------------------------------------------------
+            # 3. Read document through repository layer
+            # ------------------------------------------------
+            document_content = (
+                repository_read_document(
+                    doc_id
+                )
             )
+
+            # ------------------------------------------------
+            # 4. Return resource contents
+            # ------------------------------------------------
+            return document_content
 
         except Exception as error:
 
+            # ------------------------------------------------
+            # 5. Convert internal errors into safe MCP errors
+            # ------------------------------------------------
             raise handle_tool_error(
                 "document_resource",
                 error,

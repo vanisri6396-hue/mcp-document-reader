@@ -64,6 +64,16 @@ TOOL_PERMISSIONS = {
     },
 
     # -----------------------------
+    # BATCH READ / PROGRESS
+    # -----------------------------
+
+    "process_documents": {
+        "reader",
+        "editor",
+        "admin",
+    },
+
+    # -----------------------------
     # WRITE OPERATIONS
     # -----------------------------
 
