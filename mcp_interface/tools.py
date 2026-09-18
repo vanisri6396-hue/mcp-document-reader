@@ -110,10 +110,6 @@ TOOL_METADATA = {
         "safety": "Read-only operation.",
     },
 
-    # ========================================================
-    # LONG-RUNNING OPERATIONS
-    # ========================================================
-
     "process_documents": {
         "description": (
             "Process multiple documents while reporting "
@@ -257,6 +253,7 @@ def register_tools(
     @mcp.tool()
     def read_document(
         doc_id: str,
+        max_chars: int = 10000,
     ) -> DocumentReadResult:
 
         try:
@@ -265,18 +262,37 @@ def register_tools(
                 "read_document"
             )
 
+            if not isinstance(
+                max_chars,
+                int,
+            ):
+                raise ValueError(
+                    "max_chars must be an integer."
+                )
+
+            if max_chars < 100:
+                raise ValueError(
+                    "max_chars must be at least 100."
+                )
+
+            if max_chars > 10000:
+                raise ValueError(
+                    "max_chars cannot exceed 10000."
+                )
+
             from services.document_service import (
                 service_read_document,
             )
 
             content = service_read_document(
-                doc_id
+                doc_id,
+                max_chars,
             )
 
             characters_returned, truncated = (
                 _calculate_truncation(
                     content,
-                    100_000,
+                    max_chars,
                 )
             )
 
@@ -442,11 +458,6 @@ def register_tools(
 
     # ========================================================
     # PROCESS DOCUMENTS
-    #
-    # Demonstrates:
-    # - Context injection
-    # - Progress reporting
-    # - Cancellation handling
     # ========================================================
 
     @mcp.tool()
@@ -519,14 +530,6 @@ def register_tools(
                     start=1,
                 ):
 
-                    # ------------------------------------------------
-                    # Simulate a genuinely long-running processing
-                    # step so cancellation can be observed.
-                    #
-                    # This sleep is intentionally short and exists
-                    # only for the Level 8.8 demonstration.
-                    # ------------------------------------------------
-
                     await asyncio.sleep(
                         0.5
                     )
@@ -578,16 +581,6 @@ def register_tools(
                 anyio.get_cancelled_exc_class()
             ):
 
-                # ------------------------------------------------
-                # Cancellation reached the server.
-                #
-                # Perform any required cleanup here.
-                # Then re-raise the cancellation exception.
-                #
-                # IMPORTANT:
-                # Never swallow cancellation.
-                # ------------------------------------------------
-
                 await ctx.report_progress(
                     progress=len(
                         processed_documents
@@ -628,11 +621,6 @@ def register_tools(
         except (
             anyio.get_cancelled_exc_class()
         ):
-
-            # ----------------------------------------------------
-            # Cancellation must propagate to the MCP dispatcher.
-            # Do NOT convert cancellation into a normal tool error.
-            # ----------------------------------------------------
 
             raise
 
